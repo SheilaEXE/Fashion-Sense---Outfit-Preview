@@ -38,7 +38,13 @@ internal sealed class ModEntry : Mod
     private CategoryManager       _categoryManager = new();
     private TagManager            _tagManager      = new();
     private GlobalOrganizationManager _organizationManager = null!;
+    private ScheduleManager       _scheduleManager = new();
+    private ScheduleConditionCatalog _scheduleConditionCatalog = null!;
+    private ScheduleEvaluator     _scheduleEvaluator = null!;
     private OutfitPreviewRenderer _renderer        = null!;
+    private bool _scheduleEvaluationQueued;
+    private int _scheduleEvaluationTicks;
+    private int _scheduleEvaluationAttempts;
 
     // Quick-preview (legacy Ctrl+Click feature kept from the original mod)
     private bool    _quickPreviewOpen;
@@ -66,13 +72,19 @@ internal sealed class ModEntry : Mod
     {
         _config   = helper.ReadConfig<ModConfig>();
         _organizationManager = new GlobalOrganizationManager(helper.Data);
+        _scheduleConditionCatalog = new ScheduleConditionCatalog(helper.ModRegistry);
         _renderer = new OutfitPreviewRenderer(Monitor);
+        _scheduleEvaluator = new ScheduleEvaluator(_scheduleManager, _renderer, Monitor);
         I18n.Init(helper.Translation);
 
         helper.Events.GameLoop.GameLaunched    += OnGameLaunched;
         helper.Events.Input.ButtonPressed      += OnButtonPressed;
         helper.Events.Display.RenderedActiveMenu += OnRenderedActiveMenu;
         helper.Events.Display.MenuChanged      += OnMenuChanged;
+        helper.Events.GameLoop.DayStarted      += OnDayStarted;
+        helper.Events.GameLoop.SaveLoaded      += OnSaveLoaded;
+        helper.Events.GameLoop.TimeChanged     += OnTimeChanged;
+        helper.Events.Player.Warped            += OnWarped;
     }
 
     // GMCM
@@ -292,10 +304,55 @@ internal sealed class ModEntry : Mod
     {
         List<string> outfitNames = GetAllOutfitNames(fashionSenseMenu);
 
-        var expanded = new ExpandedOutfitsMenu(_categoryManager, _tagManager, _organizationManager, _renderer, outfitNames, fashionSenseMenu);
+        var expanded = new ExpandedOutfitsMenu(_categoryManager, _tagManager, _organizationManager,
+            _scheduleManager, _scheduleConditionCatalog, _renderer, outfitNames, fashionSenseMenu);
         Game1.activeClickableMenu = expanded;
 
         Game1.playSound("bigSelect");
+    }
+
+    // Outfit schedules
+
+    private void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
+        => QueueScheduleEvaluation();
+
+    private void OnDayStarted(object? sender, DayStartedEventArgs e)
+        => QueueScheduleEvaluation();
+
+    private void OnWarped(object? sender, WarpedEventArgs e)
+    {
+        if (e.IsLocalPlayer)
+            QueueScheduleEvaluation();
+    }
+
+    private void OnTimeChanged(object? sender, TimeChangedEventArgs e)
+        => _scheduleEvaluator.Evaluate(exactTimeTrigger: true);
+
+    private void QueueScheduleEvaluation()
+    {
+        if (_scheduleEvaluationQueued)
+            return;
+
+        _scheduleEvaluationQueued = true;
+        _scheduleEvaluationTicks = 0;
+        _scheduleEvaluationAttempts = 0;
+        Helper.Events.GameLoop.UpdateTicked += EvaluateScheduleOnNextTick;
+    }
+
+    private void EvaluateScheduleOnNextTick(object? sender, UpdateTickedEventArgs e)
+    {
+        if (++_scheduleEvaluationTicks < 15)
+            return;
+
+        _scheduleEvaluationTicks = 0;
+        _scheduleEvaluationAttempts++;
+
+        bool finished = _scheduleEvaluator.Evaluate();
+        if (!finished && _scheduleEvaluationAttempts < 20)
+            return;
+
+        Helper.Events.GameLoop.UpdateTicked -= EvaluateScheduleOnNextTick;
+        _scheduleEvaluationQueued = false;
     }
 
     private List<string> GetAllOutfitNames(IClickableMenu menu)
