@@ -63,6 +63,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
     private readonly CategoryManager       _categoryManager;
     private readonly TagManager            _tagManager;
     private readonly GlobalOrganizationManager _organizationManager;
+    private readonly SchedulePanel         _schedulePanel;
     private readonly OutfitPreviewRenderer _renderer;
     private readonly IClickableMenu?       _returnMenu;
     private readonly List<string>          _allOutfitNames;
@@ -181,6 +182,10 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
 
     // Advanced filter panel
     private readonly AdvancedFilterPanel _advancedPanel = new();
+    private bool _scheduleOutfitSelectionMode;
+    private string? _scheduleSelectionRuleId;
+    private HashSet<string> _scheduleSelectedOutfits = new(StringComparer.OrdinalIgnoreCase);
+    private HashSet<string> _scheduleSelectedTagIds = new(StringComparer.OrdinalIgnoreCase);
 
     // Computed regions (refreshed in UpdateLayout)
 
@@ -193,7 +198,6 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
     private Rectangle _rightArrow;
     private Rectangle _equipButton;
     private Rectangle _createCategoryButton;   // kept as alias → _createButton
-    private Rectangle _closeButtonRect;
 
     // Extra buttons (only visible when a custom category is active)
     private Rectangle _selectModeButton;
@@ -230,6 +234,8 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         CategoryManager       categoryManager,
         TagManager            tagManager,
         GlobalOrganizationManager organizationManager,
+        ScheduleManager       scheduleManager,
+        ScheduleConditionCatalog scheduleConditionCatalog,
         OutfitPreviewRenderer renderer,
         IReadOnlyList<string> allOutfitNames,
         IClickableMenu?       parentMenu = null)
@@ -238,7 +244,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             y:      Game1.uiViewport.Height / 2 - WindowHeight / 2,
             width:  WindowWidth,
             height: WindowHeight,
-            showUpperRightCloseButton: false)
+            showUpperRightCloseButton: true)
     {
         _categoryManager = categoryManager;
         _tagManager      = tagManager;
@@ -249,6 +255,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
 
         _categories = _categoryManager.LoadCategories();
         _tags       = _tagManager.LoadTags();
+        _schedulePanel = new SchedulePanel(scheduleManager, scheduleConditionCatalog, _tags);
 
         _selectedOutfit = GetCurrentOutfitName();
 
@@ -358,13 +365,15 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             Color.White, 4f, drawShadow: true);
 
         // Title — offset down enough to clear the window border decoration
-        SpriteText.drawStringWithScrollCenteredAt(b, I18n.Title,
+        string windowTitle = _schedulePanel.IsOpen && !_scheduleOutfitSelectionMode
+            ? _schedulePanel.CurrentTitle
+            : I18n.Title;
+        SpriteText.drawStringWithScrollCenteredAt(b, windowTitle,
             xPositionOnScreen + width / 2,
             yPositionOnScreen + 28);
 
-        // Close button (top-right)
-        DrawMenuButton(b, _closeButtonRect, "X",
-            hoverColor: Color.Salmon);
+        // Native Stardew Valley close button.
+        upperRightCloseButton?.draw(b);
 
         if (_creatingCategory || _creatingTag || _savingCurrentOutfit || _renamingOutfit)
         {
@@ -381,26 +390,32 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         }
         else
         {
-            // Normal category controls are hidden while the advanced filter strip is open.
-            // The advanced side tab stays visible so the player can toggle the filter view off again.
-            if (!_advancedPanel.IsOpen)
-                DrawCategoryBar(b);
-
             DrawAdvancedSideTab(b);
 
-            // The advanced filter view uses this vertical space, so the search box is hidden while it is open.
-            if (!_advancedPanel.IsOpen)
-                DrawSearchBar(b);
+            if (_schedulePanel.IsOpen && !_scheduleOutfitSelectionMode)
+            {
+                _schedulePanel.Draw(b);
+            }
+            else
+            {
+                // Normal category controls are hidden while the advanced filter strip is open.
+                if (!_advancedPanel.IsOpen)
+                    DrawCategoryBar(b);
 
-            if (_advancedPanel.IsOpen)
-                _advancedPanel.Draw(b, _gridArea, _previewPanel);
+                if (!_advancedPanel.IsOpen)
+                    DrawSearchBar(b);
 
-            DrawGrid(b);
+                if (_advancedPanel.IsOpen)
+                    _advancedPanel.Draw(b, _gridArea, _previewPanel);
 
-            DrawPreviewPanel(b);
-            DrawDropdownOverlay(b);
-            DrawCreateSubmenu(b);
-            DrawRenameContextMenu(b);
+                DrawGrid(b);
+                DrawPreviewPanel(b);
+                DrawDropdownOverlay(b);
+                DrawCreateSubmenu(b);
+                DrawRenameContextMenu(b);
+            }
+
+            _schedulePanel.DrawSideTabs(b);
         }
 
         drawMouse(b);
@@ -422,7 +437,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         }
 
         // Close
-        if (_closeButtonRect.Contains(x, y))
+        if (upperRightCloseButton?.containsPoint(x, y) == true)
         {
             CloseMenu();
             return;
@@ -458,11 +473,44 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             _contextOutfitName = null;
         }
 
+        if (_schedulePanel.HandleSideTabClick(x, y))
+        {
+            _advancedPanel.IsOpen = false;
+            CancelScheduleOutfitSelection();
+            CloseTransientControls();
+            UpdateLayout();
+            return;
+        }
+
+        if (_schedulePanel.IsOpen && !_scheduleOutfitSelectionMode)
+        {
+            if (_schedulePanel.HandleClick(x, y))
+            {
+                if (_schedulePanel.TryBeginOutfitSelection(out OutfitScheduleRule? rule) && rule is not null)
+                    BeginScheduleOutfitSelection(rule);
+                return;
+            }
+        }
+
         // Advanced side tab — toggle inline filter panel.
         // This stays active even when the normal category controls are hidden.
         if (_advancedButton.Contains(x, y))
         {
-            _advancedPanel.IsOpen = !_advancedPanel.IsOpen;
+            if (_scheduleOutfitSelectionMode)
+            {
+                _advancedPanel.IsOpen = !_advancedPanel.IsOpen;
+                CloseTransientControls();
+                _scrollOffset = 0;
+                UpdateLayout();
+                RebuildVisibleOutfits();
+                Game1.playSound("smallSelect");
+                return;
+            }
+
+            bool openingFromSchedule = _schedulePanel.IsOpen;
+            _schedulePanel.Close();
+            CancelScheduleOutfitSelection();
+            _advancedPanel.IsOpen = openingFromSchedule || !_advancedPanel.IsOpen;
             _dropdownOpen = false;
             _tagDropdownOpen = false;
             _colorDropdownOpen = false;
@@ -560,7 +608,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
                         DropdownLayout layout = GetDropdownLayout(
                             dropTab.Bounds,
                             availableTags.Count,
-                            230,
+                            _scheduleOutfitSelectionMode ? 360 : 230,
                             scroll);
 
                         for (int row = 0; row < layout.VisibleRows; row++)
@@ -571,18 +619,30 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
                                 layout.ItemsBounds.Y + row * CategoryBarH,
                                 layout.ItemsBounds.Width,
                                 CategoryBarH);
-                            Rectangle deleteRect = GetTagDeleteButtonBounds(itemRect);
+                            OutfitTag tag = availableTags[itemIndex];
+                            Rectangle actionRect = _scheduleOutfitSelectionMode
+                                ? GetWholeTagSelectionBounds(itemRect)
+                                : GetTagDeleteButtonBounds(itemRect);
 
-                            if (deleteRect.Contains(x, y))
+                            if (actionRect.Contains(x, y))
                             {
-                                DeleteTagAndRefresh(availableTags[itemIndex].Id);
+                                if (_scheduleOutfitSelectionMode)
+                                {
+                                    if (!_scheduleSelectedTagIds.Add(tag.Id))
+                                        _scheduleSelectedTagIds.Remove(tag.Id);
+                                    Game1.playSound("smallSelect");
+                                }
+                                else
+                                {
+                                    DeleteTagAndRefresh(tag.Id);
+                                }
                                 return;
                             }
 
                             if (!itemRect.Contains(x, y))
                                 continue;
 
-                            SelectTagFilter(availableTags[itemIndex].Id);
+                            SelectTagFilter(tag.Id);
                             return;
                         }
                     }
@@ -636,7 +696,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             }
 
             // Save current style button — only on the main/all view
-            if (IsMainView && _saveCurrentStyleButton.Contains(x, y))
+            if (!_scheduleOutfitSelectionMode && IsMainView && _saveCurrentStyleButton.Contains(x, y))
             {
                 _deleteOutfitMode = false;
                 _selectedForDeletion.Clear();
@@ -645,7 +705,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             }
 
             // Create button — only on the main/all view
-            if (IsMainView && _createCategoryButton.Contains(x, y))
+            if (!_scheduleOutfitSelectionMode && IsMainView && _createCategoryButton.Contains(x, y))
             {
                 _createSubmenuOpen = !_createSubmenuOpen;
                 _searchFocused    = false;
@@ -656,7 +716,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             }
 
             // Delete saved outfits button — only on the main/all view
-            if (IsMainView && _deleteOutfitsButton.Contains(x, y))
+            if (!_scheduleOutfitSelectionMode && IsMainView && _deleteOutfitsButton.Contains(x, y))
             {
                 _deleteOutfitMode = !_deleteOutfitMode;
                 _selectedForDeletion.Clear();
@@ -686,7 +746,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         }
 
         // Edit/delete buttons for the active category/tag/color selection.
-        if (!_advancedPanel.IsOpen && (IsCustomCategorySelected || IsTagSelected))
+        if (!_scheduleOutfitSelectionMode && !_advancedPanel.IsOpen && (IsCustomCategorySelected || IsTagSelected))
         {
             if (_selectModeButton.Contains(x, y))
             {
@@ -712,6 +772,21 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
                     UpdateLayout();
                     Game1.playSound("smallSelect");
                 }
+                return;
+            }
+        }
+
+        // In select mode, grid cells toggle removal selection instead of preview
+        if (_scheduleOutfitSelectionMode)
+        {
+            int clickedScheduleIdx = HitTestGridRow(x, y);
+            if (clickedScheduleIdx >= 0)
+            {
+                string outfitName = _visibleOutfits[clickedScheduleIdx];
+                if (!_scheduleSelectedOutfits.Add(outfitName))
+                    _scheduleSelectedOutfits.Remove(outfitName);
+                SelectOutfit(outfitName);
+                Game1.playSound("smallSelect");
                 return;
             }
         }
@@ -789,6 +864,12 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         // Equip / Confirm button
         if (_equipButton.Contains(x, y))
         {
+            if (_scheduleOutfitSelectionMode)
+            {
+                ConfirmScheduleOutfitSelection();
+                return;
+            }
+
             if (_deleteOutfitMode)
             {
                 if (_selectedForDeletion.Count == 0)
@@ -809,6 +890,67 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
                 return;
             }
         }
+    }
+
+    private void BeginScheduleOutfitSelection(OutfitScheduleRule rule)
+    {
+        _scheduleOutfitSelectionMode = true;
+        _scheduleSelectionRuleId = rule.Id;
+        _scheduleSelectedOutfits = new HashSet<string>(rule.OutfitNames, StringComparer.OrdinalIgnoreCase);
+        _scheduleSelectedTagIds = new HashSet<string>(rule.TagIds, StringComparer.OrdinalIgnoreCase);
+        _advancedPanel.IsOpen = false;
+        _searchText = string.Empty;
+        _searchFocused = false;
+        _selectedCategoryId = "all";
+        _selectedTagId = null;
+        _scrollOffset = 0;
+        CloseTransientControls();
+        RebuildVisibleOutfits();
+        UpdateLayout();
+    }
+
+    private void ConfirmScheduleOutfitSelection()
+    {
+        if (_scheduleSelectionRuleId is null
+            || (_scheduleSelectedOutfits.Count == 0 && _scheduleSelectedTagIds.Count == 0))
+        {
+            Game1.addHUDMessage(new HUDMessage(I18n.ErrorSelectFirst, HUDMessage.error_type));
+            return;
+        }
+
+        _schedulePanel.SetSelectedOutfits(
+            _scheduleSelectionRuleId,
+            _scheduleSelectedOutfits,
+            _scheduleSelectedTagIds);
+        CancelScheduleOutfitSelection();
+        Game1.playSound("newArtifact");
+    }
+
+    private void CancelScheduleOutfitSelection()
+    {
+        if (_renderer.IsPreviewActive)
+            _renderer.RestoreOriginal();
+
+        _scheduleOutfitSelectionMode = false;
+        _scheduleSelectionRuleId = null;
+        _scheduleSelectedOutfits.Clear();
+        _scheduleSelectedTagIds.Clear();
+        _selectedOutfit = null;
+        _scrollOffset = 0;
+        RebuildVisibleOutfits();
+        UpdateLayout();
+    }
+
+    private void CloseTransientControls()
+    {
+        _dropdownOpen = false;
+        _tagDropdownOpen = false;
+        _colorDropdownOpen = false;
+        _createSubmenuOpen = false;
+        _selectMode = false;
+        _selectedForRemoval.Clear();
+        _deleteOutfitMode = false;
+        _selectedForDeletion.Clear();
     }
 
     private bool TryHandleCreateSubmenuClick(int x, int y)
@@ -999,7 +1141,22 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
 
         if (key == Keys.Escape)
         {
-            if (_assignMode)
+            if (_scheduleOutfitSelectionMode)
+            {
+                CancelScheduleOutfitSelection();
+                Game1.playSound("smallSelect");
+            }
+            else if (_schedulePanel.TryCloseConditionPicker())
+            {
+                // The picker handles its own close sound.
+            }
+            else if (_schedulePanel.IsOpen)
+            {
+                _schedulePanel.Close();
+                UpdateLayout();
+                Game1.playSound("smallSelect");
+            }
+            else if (_assignMode)
             {
                 _assignMode        = false;
                 _pendingCategoryId = null;
@@ -1047,6 +1204,12 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
 
     public override void leftClickHeld(int x, int y)
     {
+        if (_schedulePanel.IsOpen && !_scheduleOutfitSelectionMode
+            && _schedulePanel.HandleScrollbarDrag(y))
+        {
+            return;
+        }
+
         if (_draggingDropdownScrollbar != DropdownKind.None
             && TryGetDropdownLayout(_draggingDropdownScrollbar, out DropdownLayout layout))
         {
@@ -1062,6 +1225,8 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
 
     public override void releaseLeftClick(int x, int y)
     {
+        _schedulePanel.ReleaseTimeHold();
+        _schedulePanel.ReleaseScrollbarDrag();
         _draggingDropdownScrollbar = DropdownKind.None;
         _dropdownScrollbarDragOffsetY = 0;
         base.releaseLeftClick(x, y);
@@ -1070,6 +1235,12 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
     public override void receiveScrollWheelAction(int direction)
     {
         int mx = Game1.getMouseX(), my = Game1.getMouseY();
+
+        if (_schedulePanel.IsOpen && !_scheduleOutfitSelectionMode
+            && _schedulePanel.HandleScroll(direction, mx, my))
+        {
+            return;
+        }
 
         if (TryGetOpenDropdownLayout(out DropdownKind dropdownKind, out DropdownLayout dropdownLayout)
             && dropdownLayout.Bounds.Contains(mx, my))
@@ -1100,6 +1271,11 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             UnhookTextInput();
             return;
         }
+
+        if (_schedulePanel.IsOpen && !_scheduleOutfitSelectionMode)
+            _schedulePanel.UpdateHeldControls(time);
+        else
+            _schedulePanel.ReleaseTimeHold();
 
         bool backspaceDown = Keyboard.GetState().IsKeyDown(Keys.Back);
 
@@ -1182,7 +1358,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         }
 
         // "Save Current Style" and "Create" only appear on the main/all view.
-        if (IsMainView)
+        if (IsMainView && !_scheduleOutfitSelectionMode)
         {
             bool saveHovered = _saveCurrentStyleButton.Contains(Game1.getMouseX(), Game1.getMouseY());
             drawTextureBox(b, Game1.mouseCursors,
@@ -1223,7 +1399,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         }
 
         // Edit/delete buttons for the active category, tag, or color tag.
-        if (IsCustomCategorySelected || IsTagSelected)
+        if (!_scheduleOutfitSelectionMode && (IsCustomCategorySelected || IsTagSelected))
         {
             bool editHovered = _selectModeButton.Contains(Game1.getMouseX(), Game1.getMouseY());
             drawTextureBox(b, Game1.mouseCursors, new Rectangle(432, 439, 9, 9),
@@ -1384,12 +1560,12 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             case DropdownKind.Tag:
                 dropdownId = "__tag_dropdown__";
                 itemCount = _tags.Count(tag => tag.Kind == TagKind.General);
-                minimumWidth = 230;
+                minimumWidth = _scheduleOutfitSelectionMode ? 360 : 230;
                 break;
             case DropdownKind.Color:
                 dropdownId = "__color_dropdown__";
                 itemCount = _tags.Count(tag => tag.Kind == TagKind.Color);
-                minimumWidth = 230;
+                minimumWidth = _scheduleOutfitSelectionMode ? 360 : 230;
                 break;
             default:
                 layout = default;
@@ -1599,7 +1775,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         DropdownLayout layout = GetDropdownLayout(
             dropTab.Bounds,
             availableTags.Count,
-            230,
+            _scheduleOutfitSelectionMode ? 360 : 230,
             scroll);
         SetDropdownScroll(dropdownKind, scroll, layout.MaxScroll);
         scroll = GetDropdownScroll(dropdownKind);
@@ -1627,21 +1803,48 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             if (itemHovered)
                 b.Draw(Game1.staminaRect, itemRect, Color.Wheat * 0.4f);
 
-            Rectangle deleteRect = GetTagDeleteButtonBounds(itemRect);
-            bool deleteHovered = deleteRect.Contains(Game1.getMouseX(), Game1.getMouseY());
-
-            Vector2 isz = Game1.smallFont.MeasureString(tag.Name);
-            Utility.drawTextWithShadow(b, tag.Name, Game1.smallFont,
+            Rectangle actionRect = _scheduleOutfitSelectionMode
+                ? GetWholeTagSelectionBounds(itemRect)
+                : GetTagDeleteButtonBounds(itemRect);
+            bool actionHovered = actionRect.Contains(Game1.getMouseX(), Game1.getMouseY());
+            string tagLabel = TruncateString(
+                tag.Name,
+                Game1.smallFont,
+                Math.Max(40, actionRect.X - itemRect.X - 18));
+            Vector2 isz = Game1.smallFont.MeasureString(tagLabel);
+            Utility.drawTextWithShadow(b, tagLabel, Game1.smallFont,
                 new Vector2(itemRect.X + 10, itemRect.Center.Y - isz.Y / 2f),
                 Game1.textColor);
 
-            drawTextureBox(b, Game1.mouseCursors, new Rectangle(432, 439, 9, 9),
-                deleteRect.X, deleteRect.Y, deleteRect.Width, deleteRect.Height,
-                deleteHovered ? Color.Salmon : Color.White, 4f, drawShadow: false);
-            b.Draw(Game1.mouseCursors,
-                new Rectangle(deleteRect.Center.X - 8, deleteRect.Center.Y - 8, 16, 16),
-                new Rectangle(323, 433, 9, 9),
-                Color.White);
+            if (_scheduleOutfitSelectionMode)
+            {
+                if (actionHovered)
+                    b.Draw(Game1.staminaRect, actionRect, Color.Wheat * 0.35f);
+
+                Vector2 actionSize = Game1.smallFont.MeasureString(I18n.ScheduleWholeTag);
+                Utility.drawTextWithShadow(b, I18n.ScheduleWholeTag, Game1.smallFont,
+                    new Vector2(actionRect.X + 4, actionRect.Center.Y - actionSize.Y / 2f),
+                    Game1.textColor);
+
+                Rectangle checkbox = new(actionRect.Right - 22, actionRect.Center.Y - 8, 16, 16);
+                b.Draw(Game1.mouseCursors, checkbox, new Rectangle(227, 425, 9, 9), Color.White, 0f,
+                    Vector2.Zero, SpriteEffects.None, 0.88f);
+                if (_scheduleSelectedTagIds.Contains(tag.Id))
+                {
+                    b.Draw(Game1.mouseCursors, checkbox, new Rectangle(236, 425, 9, 9), Color.White, 0f,
+                        Vector2.Zero, SpriteEffects.None, 0.89f);
+                }
+            }
+            else
+            {
+                drawTextureBox(b, Game1.mouseCursors, new Rectangle(432, 439, 9, 9),
+                    actionRect.X, actionRect.Y, actionRect.Width, actionRect.Height,
+                    actionHovered ? Color.Salmon : Color.White, 4f, drawShadow: false);
+                b.Draw(Game1.mouseCursors,
+                    new Rectangle(actionRect.Center.X - 8, actionRect.Center.Y - 8, 16, 16),
+                    new Rectangle(323, 433, 9, 9),
+                    Color.White);
+            }
         }
 
         DrawDropdownScrollbar(b, layout);
@@ -1652,10 +1855,17 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         return new Rectangle(itemRect.Right - 42, itemRect.Y + 6, 32, itemRect.Height - 12);
     }
 
+    private static Rectangle GetWholeTagSelectionBounds(Rectangle itemRect)
+    {
+        return new Rectangle(itemRect.Right - 142, itemRect.Y + 4, 132, itemRect.Height - 8);
+    }
+
     private void DeleteTagAndRefresh(string tagId)
     {
+        _schedulePanel.RemoveTag(tagId);
         _tagManager.DeleteTag(_tags, tagId);
         _tags = _tagManager.LoadTags();
+        _schedulePanel.SetTags(_tags);
         _advancedPanel.SetData(_categories, _tags);
         _advancedPanel.UpdateLayout(_gridArea);
         _tagDropdownOpen = false;
@@ -1729,11 +1939,13 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
                     b.Draw(Game1.staminaRect, cell, Color.Wheat * 0.25f);
 
                 // In edit/delete modes: show checkbox instead of star icon
-                if (_selectMode || _deleteOutfitMode)
+                if (_selectMode || _deleteOutfitMode || _scheduleOutfitSelectionMode)
                 {
                     bool marked = _selectMode
                         ? _selectedForRemoval.Contains(name)
-                        : _selectedForDeletion.Contains(name);
+                        : _deleteOutfitMode
+                            ? _selectedForDeletion.Contains(name)
+                            : _scheduleSelectedOutfits.Contains(name);
                     Rectangle cb = new(cell.X + 6, cell.Center.Y - 8, 16, 16);
                     b.Draw(Game1.mouseCursors, cb, new Rectangle(227, 425, 9, 9), Color.White, 0f,
                         Vector2.Zero, SpriteEffects.None, 0.88f);
@@ -1851,11 +2063,13 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
 
         // Equip / Confirm button
         bool equipHovered = _equipButton.Contains(Game1.getMouseX(), Game1.getMouseY());
-        bool equipAvailable = _deleteOutfitMode
+        bool equipAvailable = _scheduleOutfitSelectionMode
+            ? _scheduleSelectedOutfits.Count > 0 || _scheduleSelectedTagIds.Count > 0
+            : _deleteOutfitMode
             ? _selectedForDeletion.Count > 0
             : _selectedOutfit is not null && _selectedOutfit != GetCurrentOutfitName();
 
-        string buttonLabel = _deleteOutfitMode ? I18n.ButtonConfirm : I18n.ButtonEquip;
+        string buttonLabel = (_deleteOutfitMode || _scheduleOutfitSelectionMode) ? I18n.ButtonConfirm : I18n.ButtonEquip;
 
         Color equipTint = !equipAvailable ? Color.Gray
                         : equipHovered    ? (_deleteOutfitMode ? Color.Salmon : Color.Wheat)
@@ -2390,6 +2604,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             }
         }
         _tagManager.SaveTags(_tags);
+        _schedulePanel.RenameOutfit(oldName, newName);
 
         if (_selectedOutfit is not null && _selectedOutfit.Equals(oldName, StringComparison.OrdinalIgnoreCase))
             _selectedOutfit = newName;
@@ -2571,6 +2786,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             tag.OutfitNames.RemoveAll(name => deletedNames.Contains(name));
         }
         _tagManager.SaveTags(_tags);
+        _schedulePanel.RemoveOutfits(deletedNames);
 
         if (_selectedOutfit is not null && deletedNames.Contains(_selectedOutfit))
             _selectedOutfit = null;
@@ -2591,8 +2807,6 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
     {
         int ox = xPositionOnScreen;
         int oy = yPositionOnScreen;
-
-        _closeButtonRect = new Rectangle(ox + width - 56, oy + 16, 40, 36);
 
         // Row 1: save current style + "Create" buttons — below title scroll
         int saveY = oy + 76;
@@ -2616,7 +2830,8 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         _categoryBar = new Rectangle(ox + Padding, categoryBarY, width - PreviewPanelW - Padding * 3, CategoryBarH);
 
         // Side tab for advanced filters, placed on the left side of the window like vanilla tabs.
-        _advancedButton = new Rectangle(Math.Max(4, ox - 54), oy + 170, 52, 64);
+        _advancedButton = new Rectangle(Math.Max(4, ox - 54), oy + 104, 52, 58);
+        _schedulePanel.UpdateLayout(new Rectangle(ox, oy, width, height));
 
         // Main delete button and edit/delete buttons (placed at the far right of the category row).
         int actionRight = _categoryBar.Right;
@@ -2690,6 +2905,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         // Wire advanced filter panel layout (uses gridArea inline)
         _advancedPanel.SetData(_categories, _tags);
         _advancedPanel.UpdateLayout(_gridArea);
+        _schedulePanel.SetTags(_tags);
 
         RebuildCategoryTabs();
     }
@@ -2710,7 +2926,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
 
         // When a category/tag/color is active, show only that active selector plus Edit/Delete.
         // The other selectors stay hidden to avoid mixing editing modes.
-        if (IsCustomCategorySelected)
+        if (!_scheduleOutfitSelectionMode && IsCustomCategorySelected)
         {
             string dropLabel = _categories.FirstOrDefault(c => c.Id == _selectedCategoryId)?.Name ?? I18n.ButtonCategory;
             int dropW = Math.Min(220, Math.Max(132, (int)Game1.smallFont.MeasureString(dropLabel).X + 32));
@@ -2719,7 +2935,7 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
             return;
         }
 
-        if (selectedTag is not null)
+        if (!_scheduleOutfitSelectionMode && selectedTag is not null)
         {
             string dropdownId = selectedTag.Kind == TagKind.Color ? "__color_dropdown__" : "__tag_dropdown__";
             int minW = selectedTag.Kind == TagKind.Color ? 100 : 90;
@@ -2732,25 +2948,34 @@ internal sealed class ExpandedOutfitsMenu : IClickableMenu
         // Main/all view: show all selectors.
         if (_categories.Count > 0)
         {
-            string dropLabel = I18n.ButtonCategory;
-            int dropW = Math.Max(132, (int)Game1.smallFont.MeasureString(dropLabel).X + 32);
-            _categoryTabs.Add(("__dropdown__", dropLabel, new Rectangle(tabX, tabY, dropW, CategoryBarH)));
+            string dropLabel = _scheduleOutfitSelectionMode && IsCustomCategorySelected
+                ? _categories.FirstOrDefault(c => c.Id == _selectedCategoryId)?.Name ?? I18n.ButtonCategory
+                : I18n.ButtonCategory;
+            int dropW = Math.Min(220, Math.Max(132, (int)Game1.smallFont.MeasureString(dropLabel).X + 32));
+            string shownDropLabel = TruncateString(dropLabel, Game1.smallFont, dropW - 24);
+            _categoryTabs.Add(("__dropdown__", shownDropLabel, new Rectangle(tabX, tabY, dropW, CategoryBarH)));
             tabX += dropW + 6;
         }
 
         if (_tags.Any(t => t.Kind == TagKind.General))
         {
-            string tagLabel = I18n.ButtonTags;
-            int tagW = Math.Max(90, (int)Game1.smallFont.MeasureString(tagLabel).X + 28);
-            _categoryTabs.Add(("__tag_dropdown__", tagLabel, new Rectangle(tabX, tabY, tagW, CategoryBarH)));
+            string tagLabel = _scheduleOutfitSelectionMode && selectedTag?.Kind == TagKind.General
+                ? selectedTag.Name
+                : I18n.ButtonTags;
+            int tagW = Math.Min(220, Math.Max(90, (int)Game1.smallFont.MeasureString(tagLabel).X + 28));
+            string shownTagLabel = TruncateString(tagLabel, Game1.smallFont, tagW - 20);
+            _categoryTabs.Add(("__tag_dropdown__", shownTagLabel, new Rectangle(tabX, tabY, tagW, CategoryBarH)));
             tabX += tagW + 6;
         }
 
         if (_tags.Any(t => t.Kind == TagKind.Color))
         {
-            string colorLabel = I18n.ButtonColors;
-            int colorW = Math.Max(100, (int)Game1.smallFont.MeasureString(colorLabel).X + 28);
-            _categoryTabs.Add(("__color_dropdown__", colorLabel, new Rectangle(tabX, tabY, colorW, CategoryBarH)));
+            string colorLabel = _scheduleOutfitSelectionMode && selectedTag?.Kind == TagKind.Color
+                ? selectedTag.Name
+                : I18n.ButtonColors;
+            int colorW = Math.Min(220, Math.Max(100, (int)Game1.smallFont.MeasureString(colorLabel).X + 28));
+            string shownColorLabel = TruncateString(colorLabel, Game1.smallFont, colorW - 20);
+            _categoryTabs.Add(("__color_dropdown__", shownColorLabel, new Rectangle(tabX, tabY, colorW, CategoryBarH)));
         }
     }
 

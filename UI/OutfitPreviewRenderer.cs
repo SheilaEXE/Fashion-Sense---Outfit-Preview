@@ -74,6 +74,41 @@ internal sealed class OutfitPreviewRenderer
         _activeOutfitName = null;
     }
 
+    /// <summary>Equip a saved outfit as a real change, without creating preview state.</summary>
+    public bool EquipOutfitImmediately(string outfitName)
+    {
+        try
+        {
+            bool equipped = SetOutfitSilently(outfitName);
+            if (equipped)
+            {
+                _snapshot = null;
+                _activeOutfitName = null;
+            }
+
+            return equipped;
+        }
+        catch (Exception ex)
+        {
+            _monitor.Log($"Error equipping Fashion Sense outfit '{outfitName}': {ex}", LogLevel.Warn);
+            return false;
+        }
+    }
+
+    /// <summary>Return whether a saved outfit can currently be resolved by Fashion Sense.</summary>
+    public bool OutfitExists(string outfitName)
+    {
+        try
+        {
+            object? outfitManager = GetOutfitManager();
+            return outfitManager is not null && DoesOutfitExist(outfitManager, outfitName);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>Rename a saved Fashion Sense outfit.</summary>
     public bool RenameOutfit(string oldName, string newName)
     {
